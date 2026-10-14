@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: food-friend-backend
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn run:app
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: APP_TIMEZONE
+        value: Asia/Kolkata
+      # Fixed key so staff stay logged in across restarts.
+      - key: SECRET_KEY
+        generateValue: true
+      # Asked for when the Blueprint is created.
+      - key: OPENAI_API_KEY
+        sync: false
+      # Neon connection string, e.g. postgresql://user:password@host/dbname?sslmode=require
+      - key: DATABASE_URL
+        sync: false
+      # The Vercel address of the frontend, e.g. https://food-friend.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
