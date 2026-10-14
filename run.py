@@ -1,8 +1,10 @@
 """
 Food Friend Backend - Main Entry Point
-Run this file to start the Flask server
+Run this file to start the Flask server on your computer.
+On a hosting server use gunicorn instead: gunicorn run:app (settings in gunicorn.conf.py).
 """
 
+import os
 import socket
 from app import create_app
 
@@ -36,15 +38,23 @@ if __name__ == '__main__':
     print("📱 For MOBILE ACCESS:")
     print(f"   1. Frontend: https://{local_ip}:5173")
     print(f"      (Accept the security warning for self-signed cert)")
-    print(f"   2. Chef Portal: https://{local_ip}:5173/chef")
+    print(f"   2. Staff dashboard: https://{local_ip}:5173/admin")
     print()
     print("🔗 API endpoints:")
-    print("   - POST /api/chat")
-    print("   - POST /api/nutrition/generate")
-    print("   - POST /api/order")
-    print("   - GET  /api/orders")
-    print("   - PUT  /api/order/<id>/status")
+    print("   - GET  /api/menu?code=<table QR code>")
+    print("   - POST /api/orders  (customer places an order)")
+    print("   - GET  /api/orders/<order number>?code=<table QR code>")
+    print("   - GET  /api/orders/<order number>/nutrition?code=<table QR code>  (OpenAI)")
+    print("   - POST /api/chat  (OpenAI, needs the table QR code and order number)")
+    print("   - GET  /api/tables/<number>?code=<table QR code>")
+    print("   - POST /api/auth/register, /api/auth/login  (admin & chef accounts)")
+    print("   - /api/kitchen/orders  (kitchen view, chef or admin login)")
+    print("   - /api/admin/...  (admin view, admin login)")
+    print()
+    print("   Staff login:    https://localhost:5173/admin/login")
+    print("   Staff register: https://localhost:5173/admin/register")
     print()
     print("=" * 50)
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Debug mode lets anyone who can open the server run code on it, so it is only on with FLASK_DEBUG=1.
+    app.run(debug=os.getenv('FLASK_DEBUG') == '1', host='0.0.0.0', port=int(os.getenv('PORT', '5000')))

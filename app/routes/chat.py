@@ -1,109 +1,115 @@
 """
-Food Friend Backend - Chat Routes
-Handles all chat-related API endpoints
-STRICT: All responses must be 2 SHORT sentences for mobile
+Food Friend Backend - "Chat while you wait" persona bot for customers with an order
 """
 
-from flask import Blueprint, request, jsonify
-from app.services.groq_service import GroqService
-from app.prompts.personas import get_persona_prompt, get_lover_prompt, get_full_prompt
+import threading
+import time
+from collections import defaultdict, deque
+
+from flask import Blueprint, jsonify, request
+from sqlalchemy.orm import joinedload
+
+from app.models import Category, MenuItem
+from app.prompts.personas import GREETING_REQUEST, LOVER_ROLES, LOVER_STAGES, PERSONAS, build_instructions
+from app.routes.public import find_table_order
+from app.services import ai_service
+from app.services.ai_service import AIUnavailableError
+from app.utils.validation import ValidationError, clean_text, get_json_body
 
 chat_bp = Blueprint('chat', __name__)
-groq_service = GroqService()
+
+MAX_MESSAGE_LENGTH = 500
+MAX_HISTORY_MESSAGES = 12
+MAX_MENU_ITEMS = 120
+
+# Keeps one order from running up the OpenAI bill.
+MAX_MESSAGES_PER_ORDER = 60
+MESSAGE_WINDOW_SECONDS = 60 * 60
+_recent_messages = defaultdict(deque)
+_recent_messages_lock = threading.Lock()
+
+
+def _allow_message(order_id):
+    now = time.monotonic()
+    with _recent_messages_lock:
+        sent = _recent_messages[order_id]
+        while sent and now - sent[0] > MESSAGE_WINDOW_SECONDS:
+            sent.popleft()
+        if len(sent) >= MAX_MESSAGES_PER_ORDER:
+            return False
+        sent.append(now)
+        return True
+
+
+def _menu_for(restaurant_id):
+    """The dishes guests can see, so the buddies only ever talk about real food."""
+    return (
+        MenuItem.query.options(joinedload(MenuItem.category))
+        .join(Category, MenuItem.category_id == Category.id)
+        .filter(
+            MenuItem.restaurant_id == restaurant_id,
+            MenuItem.is_archived.is_(False),
+            Category.is_visible.is_(True),
+        )
+        .order_by(Category.sort_order, Category.id, MenuItem.sort_order, MenuItem.id)
+        .limit(MAX_MENU_ITEMS)
+        .all()
+    )
+
+
+def _clean_history(raw):
+    if not isinstance(raw, list):
+        raise ValidationError('Conversation history must be a list.')
+    history = []
+    for turn in raw[-MAX_HISTORY_MESSAGES:]:
+        if not isinstance(turn, dict) or turn.get('role') not in ('user', 'assistant'):
+            raise ValidationError('Conversation history is not valid.')
+        content = clean_text(turn.get('content'), 'Message', MAX_MESSAGE_LENGTH * 2)
+        if content:
+            history.append({'role': turn['role'], 'content': content})
+    return history
+
+
+def _clean_lover_config(raw):
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or raw.get('gender') not in LOVER_ROLES or raw.get('relationshipStatus') not in LOVER_STAGES:
+        raise ValidationError('Pick who I should be and your relationship status.')
+    return raw
 
 
 @chat_bp.route('/chat', methods=['POST'])
 def chat():
     """
-    Main chat endpoint - Returns 2 SHORT sentences only
+    Body: {code, orderNumber, persona, message, conversationHistory, loverConfig?}
+    An empty message starts the conversation with a greeting.
     """
     try:
-        data = request.get_json()
-        print(f"📨 Chat request received")
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        message = data.get('message', '')
-        persona = data.get('persona', 'friend')
-        lover_config = data.get('loverConfig')
-        order_context = data.get('orderContext')
-        conversation_history = data.get('conversationHistory', [])
-        
-        # Get the appropriate system prompt
-        if persona == 'lover' and lover_config:
-            system_prompt = get_lover_prompt(
-                lover_config.get('gender', 'other'),
-                lover_config.get('relationshipStatus', 'single')
-            )
-        else:
-            system_prompt = get_persona_prompt(persona)
-        
-        # Add strict length requirement
-        system_prompt += "\n\n⚠️ CRITICAL: Reply in EXACTLY 2 SHORT sentences! Max 15 words total! No exceptions!"
-        
-        # Add order context
-        if order_context:
-            items_str = ", ".join([f"{item.get('name', 'item')}" 
-                                   for item in order_context.get('items', [])])
-            system_prompt += f"\n\nThey ordered: {items_str}"
-        
-        # Handle initial greeting
-        if message == 'START_CONVERSATION':
-            message = "Say a quick 2-sentence hello!"
-        
-        # Generate response using GROQ
-        response = groq_service.generate_chat_response(
-            system_prompt=system_prompt,
-            user_message=message,
-            conversation_history=conversation_history
-        )
-        
-        print(f"✅ Chat response: {response}")
-        
-        return jsonify({'response': response})
-        
-    except Exception as e:
-        print(f"❌ Chat error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'response': "Hey! What's up? 😅",
-            'error': str(e)
-        }), 200
+        data = get_json_body(request)
+        persona = data.get('persona')
+        if persona not in PERSONAS:
+            raise ValidationError('Pick someone to chat with.')
+        message = clean_text(data.get('message'), 'Message', MAX_MESSAGE_LENGTH)
+        history = _clean_history(data.get('conversationHistory', []))
+        if not message and history:
+            raise ValidationError('Type a message.')
+        lover_config = _clean_lover_config(data.get('loverConfig')) if persona == 'lover' else None
+    except ValidationError as error:
+        return jsonify({'error': error.message}), 400
 
+    table, order, error = find_table_order(data.get('code'), data.get('orderNumber'))
+    if error:
+        return error
+    if not _allow_message(order.id):
+        return jsonify({'error': "That's a lot of chatting! Take a little break and enjoy your food."}), 429
 
-@chat_bp.route('/chat/greeting', methods=['POST'])
-def get_greeting():
-    """
-    Get initial greeting - 2 SHORT sentences only
-    """
+    instructions = build_instructions(
+        persona, lover_config, order.restaurant.name, table.number, order.items, order.status,
+        _menu_for(order.restaurant_id),
+    )
+    messages = history + [{'role': 'user', 'content': message or GREETING_REQUEST}]
     try:
-        data = request.get_json()
-        persona = data.get('persona', 'friend')
-        order_context = data.get('orderContext')
-        
-        system_prompt = get_persona_prompt(persona)
-        system_prompt += "\n\n⚠️ CRITICAL: Reply in EXACTLY 2 SHORT sentences! Max 15 words!"
-        
-        if order_context:
-            items_str = ", ".join([f"{item.get('name', 'item')}" 
-                                   for item in order_context.get('items', [])])
-            greeting_message = f"Say quick hello! They ordered: {items_str}"
-        else:
-            greeting_message = "Say a quick 2-sentence hello!"
-        
-        response = groq_service.generate_chat_response(
-            system_prompt=system_prompt,
-            user_message=greeting_message,
-            conversation_history=[]
-        )
-        
-        return jsonify({'response': response})
-        
-    except Exception as e:
-        print(f"❌ Greeting error: {str(e)}")
-        return jsonify({
-            'response': "Hey there! Ready to chat? 🎉",
-            'error': str(e)
-        })
+        reply = ai_service.chat_reply(instructions, messages, user_id=f'order-{order.id}')
+    except AIUnavailableError as ai_error:
+        return jsonify({'error': str(ai_error)}), ai_error.status
+    return jsonify({'response': reply})
